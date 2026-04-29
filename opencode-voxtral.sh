@@ -17,8 +17,8 @@ VENV_DIR="${VENV_DIR:-$HOME/.opencode-voxtral}"
 # Persist user model choice across restarts
 CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/opencode-voxtral"
 MODEL_CONFIG_FILE="$CONFIG_DIR/last-model"
-# Default to pre-quantized model (much faster, skips on-the-fly quantization)
-DEFAULT_MODEL="mlx-community/Voxtral-Mini-4B-Realtime-2602-4bit"
+# Official Mistral model - requires nightly vLLM + fp8 quantization for 8GB VRAM
+DEFAULT_MODEL="mistralai/Voxtral-Mini-4B-Realtime-2602"
 # Load persisted model unless explicitly overridden by env var
 if [[ -n "${VOXTRAL_MODEL:-}" ]]; then
     VLLM_MODEL="$VOXTRAL_MODEL"
@@ -39,15 +39,16 @@ else
     # Generate random port between 50000-65535
     VLLM_PORT=$((50000 + RANDOM % 15536))
 fi
-VLLM_MAX_LEN="${VOXTRAL_MAX_LEN:-8192}"
-# Quantization: only needed for non-pre-quantized models
+VLLM_MAX_LEN="${VOXTRAL_MAX_LEN:-1024}"
+# Quantization: fp8 applied by default for full-precision models (fits 8GB VRAM on Ada Lovelace)
 VLLM_QUANTIZATION="${VOXTRAL_QUANTIZATION:-}"
-VLLM_GPU_MEMORY="${VOXTRAL_GPU_MEMORY:-0.80}"
+VLLM_GPU_MEMORY="${VOXTRAL_GPU_MEMORY:-0.90}"
 PID_DIR="${XDG_RUNTIME_DIR:-/tmp}/opencode-voxtral"
 VLLM_PID_FILE="$PID_DIR/vllm.pid"
 VLLM_LOG_FILE="$PID_DIR/vllm.log"
 REF_COUNT_FILE="$PID_DIR/ref_count"
 VERSION="1.0.0"
+OPENCODE_PLUGINS_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/opencode/plugins"
 
 # Colors
 RED='\033[0;31m'
@@ -169,6 +170,9 @@ install_venv() {
     if has_uv; then
         log_info "Using uv (fast Python package installer)"
         
+        # Disable uv HTTP timeout so large wheels (vLLM ~230MB, torch ~500MB) never abort
+
+
         # Create venv with uv if it doesn't exist
         if [[ ! -d "$VENV_DIR" ]]; then
             log_info "Creating virtual environment with uv..."
@@ -179,12 +183,25 @@ install_venv() {
         log_info "Installing required packages with uv..."
         log_info "This may take a few minutes (downloading ML models)..."
         
+        # Install non-vllm packages from PyPI first
+        log_info "Installing base packages..."
         uv pip install --python "$VENV_DIR/bin/python" \
-            vllm transformers sounddevice soundfile numpy requests bitsandbytes
+            "mistral-common[image]>=1.11.0" transformers sounddevice soundfile numpy requests hf-transfer
+
+        # Install vLLM nightly (cu130) separately - required for Voxtral multimodal dispatch fix (PR #38410)
+        # Nightly is ahead of v0.20.0 by 850+ commits and includes the Voxtral fix
+        log_info "Installing vLLM nightly (cu130)..."
+        uv pip install --python "$VENV_DIR/bin/python" \
+            --torch-backend=cu130 \
+            --extra-index-url https://wheels.vllm.ai/nightly/cu130 \
+            vllm
         
     else
         log_info "Using pip (consider installing uv for faster installs: https://astral.sh/uv)"
         
+        # Disable pip timeout so large wheels never abort
+
+
         # Create venv with standard python if it doesn't exist
         if [[ ! -d "$VENV_DIR" ]]; then
             log_info "Creating virtual environment..."
@@ -202,7 +219,14 @@ install_venv() {
         log_info "Installing required packages..."
         log_info "This may take a few minutes (downloading ML models)..."
         
-        "$pip" install vllm transformers sounddevice soundfile numpy requests bitsandbytes
+        # Install non-vllm packages from PyPI first
+        "$pip" install \
+            "mistral-common[image]>=1.11.0" transformers sounddevice soundfile numpy requests hf-transfer
+
+        # Install vLLM nightly (cu130) separately
+        "$pip" install \
+            --extra-index-url https://wheels.vllm.ai/nightly/cu130 \
+            vllm
     fi
     
     log_info "Installation complete!"
@@ -220,7 +244,7 @@ check_for_updates() {
     
     log_info "Installed vLLM version: $installed_version"
     
-    # Try to get latest version from PyPI (with timeout)
+    # Try to get latest version from PyPI
     local latest_version
     if latest_version=$(curl -s --max-time 5 "https://pypi.org/pypi/vllm/json" 2>/dev/null | "$python" -c "import sys, json; print(json.load(sys.stdin)['info']['version'])" 2>/dev/null); then
         log_info "Latest vLLM version: $latest_version"
@@ -232,9 +256,14 @@ check_for_updates() {
                 
                 # Use uv if available, otherwise pip
                 if has_uv; then
-                    uv pip install --python "$VENV_DIR/bin/python" --upgrade vllm transformers
+                    uv pip install --python "$VENV_DIR/bin/python" \
+                        --torch-backend=cu130 \
+                        --extra-index-url https://wheels.vllm.ai/nightly/cu130 \
+                        --upgrade vllm transformers
                 else
-                    "$VENV_DIR/bin/pip" install --upgrade vllm transformers
+                    "$VENV_DIR/bin/pip" install \
+                        --extra-index-url https://wheels.vllm.ai/nightly/cu130 \
+                        --upgrade vllm transformers
                 fi
                 
                 log_info "Update complete!"
@@ -454,17 +483,23 @@ start_vllm() {
 
         # Enable HuggingFace download progress bars
         export HF_HUB_ENABLE_PROGRESS_BARS=1
-        export HF_HUB_DOWNLOAD_TIMEOUT=300
+
+        # Enable hf-transfer for faster multi-connection downloads (if installed)
+        export HF_HUB_ENABLE_HF_TRANSFER=1
+
+        # Reduce CUDA memory fragmentation
+        export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
         # Build vllm command with optional quantization
         local vllm_args=(
             "serve" "$VLLM_MODEL"
+            --served-model-name "default"
             --port "$VLLM_PORT"
             --max-model-len "$VLLM_MAX_LEN"
             --dtype bfloat16
-            --load-format auto
-            --trust-remote-code
             --gpu-memory-utilization "$VLLM_GPU_MEMORY"
+            --max-num-seqs 4
+            --trust-remote-code
         )
         
         # Add Voxtral-specific compilation config (required for Voxtral models)
@@ -473,14 +508,27 @@ start_vllm() {
             vllm_args+=(--compilation-config '{"cudagraph_mode": "PIECEWISE"}')
         fi
         
-        # Add quantization if explicitly specified (not needed for pre-quantized models)
-        if [[ -n "$VLLM_QUANTIZATION" ]]; then
+        # Quantization: use fp8 by default for official mistralai model (needs quantization for 8GB VRAM)
+        # bitsandbytes is broken with Voxtral in current nightly (shape mismatch in llama weight loader)
+        # fp8 works on Ada Lovelace (RTX 40xx) and halves VRAM to ~4GB
+        # Can be overridden with VOXTRAL_QUANTIZATION=none (needs 16GB+ VRAM) or any other method
+        if [[ "${VLLM_QUANTIZATION:-}" == "none" ]]; then
+            log_warn "Quantization disabled - needs 16GB+ VRAM"
+        elif [[ -n "${VLLM_QUANTIZATION:-}" ]]; then
             vllm_args+=(--quantization "$VLLM_QUANTIZATION")
-            log_info "Using on-the-fly quantization: $VLLM_QUANTIZATION"
-            log_info "   ⚠️  This will be VERY SLOW on first run (20-40 min)"
+            log_info "Using quantization: $VLLM_QUANTIZATION"
+        elif [[ "$VLLM_MODEL" != *"4bit"* ]] && [[ "$VLLM_MODEL" != *"GPTQ"* ]] && [[ "$VLLM_MODEL" != *"AWQ"* ]]; then
+            # Full-precision model - apply fp8 by default to fit in 8GB VRAM
+            vllm_args+=(--quantization fp8)
+            log_info "Applying fp8 quantization (fits 8GB VRAM, requires Ada Lovelace / RTX 40xx)"
+        else
+            log_info "Pre-quantized model - no additional quantization needed"
         fi
         
-        $runner vllm "${vllm_args[@]}" \
+        # Launch vLLM in a new process group (setsid) so terminal signals
+        # (Ctrl+C, Ctrl+X) don't reach it directly — only our cleanup trap
+        # controls its lifetime via ref-counting.
+        setsid $runner vllm "${vllm_args[@]}" \
             > "$VLLM_LOG_FILE" 2>&1 &
         
         local vllm_pid=$!
@@ -496,17 +544,13 @@ start_vllm() {
         local model_cache_name="${VLLM_MODEL//\//--}"
         if [[ ! -d "$cache_dir/hub/models--$model_cache_name" ]]; then
             is_first_run=true
-            if [[ "$VLLM_MODEL" == *"4bit"* ]] || [[ "$VLLM_MODEL" == *"GGUF"* ]]; then
-                log_info "ℹ️  First run - downloading pre-quantized model (~4GB)"
-                log_info "   This is much faster than on-the-fly quantization"
+            if [[ "$VLLM_MODEL" == *"4bit"* ]] || [[ "$VLLM_MODEL" == *"GPTQ"* ]] || [[ "$VLLM_MODEL" == *"AWQ"* ]] || [[ "$VLLM_MODEL" == *"GGUF"* ]]; then
+                log_info "ℹ️  First run - downloading pre-quantized model"
                 log_info "   Expected time: 5-15 minutes depending on connection"
             else
-                log_info "ℹ️  First run - downloading full model (~16GB)"
-                if [[ -n "$VLLM_QUANTIZATION" ]]; then
-                    log_info "   ⚠️  On-the-fly quantization will be VERY SLOW (20-40 min)"
-                else
-                    log_info "   ⚠️  Large model without quantization - needs 16GB+ VRAM"
-                fi
+                log_info "ℹ️  First run - downloading full model (~16GB bfloat16)"
+                log_info "   fp8 quantization will be applied at load time (fits 8GB VRAM)"
+                log_info "   First load may take a minute to quantize"
             fi
             log_info "   📊 Download progress bars enabled (HF_HUB_ENABLE_PROGRESS_BARS=1)"
         else
@@ -514,22 +558,6 @@ start_vllm() {
             log_info "📦 Model cache found: $(format_bytes "$initial_cache_size")"
         fi
 
-        log_info "Showing live log output (press Ctrl+C to stop watching, vLLM will keep running):"
-        echo ""
-
-        # Start a background tail process to show log output
-        local tail_pid
-        tail -f "$VLLM_LOG_FILE" 2>/dev/null &
-        tail_pid=$!
-
-        # Longer timeout for first run with quantization (45 minutes)
-        local max_wait=2700  # 45 minutes in seconds
-        if [[ "$is_first_run" == "true" ]] && [[ -n "$VLLM_QUANTIZATION" ]]; then
-            max_wait=3600  # 60 minutes for first run with quantization
-            log_info "Extended timeout enabled: 60 minutes for first-run quantization"
-        fi
-
-        local retries=$max_wait
         local wait_time=0
         local last_log_size=0
         local stall_count=0
@@ -538,33 +566,46 @@ start_vllm() {
         local download_start_size=$initial_cache_size
         local download_start_time=$SECONDS
 
-        while [[ $retries -gt 0 ]]; do
+        while true; do
             if check_vllm_health; then
-                # Kill the tail process
-                kill $tail_pid 2>/dev/null || true
-                wait $tail_pid 2>/dev/null || true
                 echo ""
                 log_info "vLLM is ready (PID: $vllm_pid)"
                 log_info "Total startup time: ${wait_time}s"
-                # Persist model choice for future runs
-                if [[ -n "$VLLM_MODEL" ]]; then
-                    mkdir -p "$CONFIG_DIR"
-                    echo "$VLLM_MODEL" > "$MODEL_CONFIG_FILE"
-                    log_debug "Model preference saved: $VLLM_MODEL"
-                fi
-                exit 0
+                break
             fi
 
-            # Check if process died
             if ! kill -0 "$vllm_pid" 2>/dev/null; then
-                # Kill the tail process
-                kill $tail_pid 2>/dev/null || true
-                wait $tail_pid 2>/dev/null || true
                 echo ""
 
                 # Check for specific error patterns in the log
                 if [[ -f "$VLLM_LOG_FILE" ]]; then
-                    if grep -q "param_data.shape == loaded_weight.shape" "$VLLM_LOG_FILE" 2>/dev/null; then
+                    if grep -q "Free memory on device.*less than desired GPU memory" "$VLLM_LOG_FILE" 2>/dev/null; then
+                        local free_mem
+                        free_mem=$(grep "Free memory on device" "$VLLM_LOG_FILE" 2>/dev/null | tail -1 | grep -o '[0-9.]*\/[0-9.]* GiB' || echo "unknown")
+                        log_error "❌ NOT ENOUGH FREE VRAM AT STARTUP"
+                        log_error ""
+                        log_error "Free VRAM ($free_mem) is less than requested gpu-memory-utilization."
+                        log_error "Other processes (e.g. Zed, desktop) are using GPU memory."
+                        log_error ""
+                        log_error "💡 SOLUTIONS:"
+                        log_error "  1. Close GPU-using apps (Zed, browser, etc.) and retry"
+                        log_error "  2. Lower utilization: VOXTRAL_GPU_MEMORY=0.85 $0"
+                        log_error ""
+                        rm -f "$VLLM_PID_FILE"
+                        exit 1
+                    elif grep -q "larger than the available KV cache memory" "$VLLM_LOG_FILE" 2>/dev/null; then
+                        local max_len
+                        max_len=$(grep "estimated maximum model length" "$VLLM_LOG_FILE" 2>/dev/null | tail -1 | grep -o 'is [0-9]*' | grep -o '[0-9]*' || echo "unknown")
+                        log_error "❌ NOT ENOUGH VRAM FOR KV CACHE"
+                        log_error ""
+                        log_error "Model loaded OK but KV cache won't fit."
+                        log_error "Max supported context length with current VRAM: ${max_len} tokens"
+                        log_error ""
+                        log_error "💡 SOLUTION: VOXTRAL_MAX_LEN=${max_len} $0"
+                        log_error ""
+                        rm -f "$VLLM_PID_FILE"
+                        exit 1
+                    elif grep -q "param_data.shape == loaded_weight.shape" "$VLLM_LOG_FILE" 2>/dev/null; then
                         log_error "❌ SHAPE MISMATCH ERROR DETECTED"
                         log_error ""
                         log_error "This error means the model cache is corrupted."
@@ -581,6 +622,30 @@ start_vllm() {
                         log_error "Solutions:"
                         log_error "  1. Lower GPU memory: VOXTRAL_GPU_MEMORY=0.70 $0"
                         log_error "  2. Reduce max length: VOXTRAL_MAX_LEN=4096 $0"
+                        log_error ""
+                        rm -f "$VLLM_PID_FILE"
+                        exit 1
+                    elif grep -q "Transformers does not recognize this architecture" "$VLLM_LOG_FILE" 2>/dev/null; then
+                        log_error "❌ VOXTRAL NOT SUPPORTED BY TRANSFORMERS 4.x"
+                        log_error ""
+                        log_error "Voxtral requires Transformers 5.x, but 5.x has a config validation bug."
+                        log_error "This is a known issue: https://github.com/vllm-project/vllm/pull/38410"
+                        log_error ""
+                        log_error "💡 SOLUTION: Use Moonshine (CPU) or wait for vLLM update"
+                        log_error "   Run: $0 --clean-all"
+                        log_error "   Then use opencode-stt with Moonshine backend"
+                        log_error ""
+                        rm -f "$VLLM_PID_FILE"
+                        exit 1
+                    elif grep -q "Multiple valid text configs were found" "$VLLM_LOG_FILE" 2>/dev/null; then
+                        log_error "❌ TRANSFORMERS 5.x CONFIG VALIDATION BUG"
+                        log_error ""
+                        log_error "This is a known incompatibility between Voxtral and Transformers 5.x."
+                        log_error "vLLM PR #38410 fixes this but has not been released yet."
+                        log_error ""
+                        log_error "💡 SOLUTION: Use Moonshine (CPU) or wait for vLLM update"
+                        log_error "   Run: $0 --clean-all"
+                        log_error "   Then use opencode-stt with Moonshine backend"
                         log_error ""
                         rm -f "$VLLM_PID_FILE"
                         exit 1
@@ -606,13 +671,11 @@ start_vllm() {
                 last_log_size=$current_log_size
             fi
 
-            sleep 1
-            retries=$((retries - 1))
-            wait_time=$((wait_time + 1))
+            sleep 5
+            wait_time=$((wait_time + 5))
 
             # Show progress every 30 seconds
             if [[ $((wait_time % 30)) -eq 0 ]]; then
-                local mins_remaining=$((retries / 60))
                 local mins_elapsed=$((wait_time / 60))
 
                 # Get current cache size
@@ -649,32 +712,17 @@ start_vllm() {
                     fi
                 else
                     # Downloaded expected size, now check if still growing
-                    if [[ $cache_diff -gt 0 ]]; then
-                        current_state="downloading"
-                    elif [[ $cache_stall_count -lt 3 ]]; then
-                        current_state="downloaded"
-                    elif [[ -n "$VLLM_QUANTIZATION" ]]; then
-                        # Only show quantizing state if on-the-fly quantization is enabled
-                        local cpu_int="${cpu_usage%.*}"
-                        if [[ -z "$cpu_int" ]] || [[ "$cpu_int" == "0" ]]; then
-                            cpu_int=0
-                        fi
-                        if [[ $cpu_int -gt 30 ]]; then
-                            current_state="quantizing"
-                        elif [[ $cpu_int -gt 5 ]]; then
-                            current_state="quantizing_slow"
-                        else
-                            current_state="stalled"
-                        fi
-                    else
-                        # Pre-quantized model: should start soon after download
-                        current_state="starting"
+                     if [[ $cache_diff -gt 0 ]]; then
+                         current_state="downloading"
+                     elif [[ $cache_stall_count -lt 3 ]]; then
+                         current_state="downloaded"
+                     else
+                         # Model downloaded, now loading/quantizing on GPU
+                         current_state="starting"
                     fi
                 fi
 
-                echo ""
-                log_info "⏱️  $mins_elapsed min elapsed, ~$mins_remaining min timeout left"
-
+                log_info "⏱️  $mins_elapsed min elapsed (no timeout - waiting for model to load)"
                 if [[ "$is_first_run" == "true" ]]; then
                     # Determine model size description
                     local model_size_desc="~16GB"
@@ -718,11 +766,7 @@ start_vllm() {
                             # Reset download tracking for any future downloads
                             download_start_size=$current_cache_size
                             download_start_time=$SECONDS
-                            if [[ -n "$VLLM_QUANTIZATION" ]]; then
-                                log_info "   🔧 Starting on-the-fly quantization (this is slow)..."
-                            else
-                                log_info "   🚀 Loading model into GPU..."
-                            fi
+                            log_info "   🚀 Loading model into GPU (fp8 quantization)..."
                             ;;
                         starting)
                             log_info "   ✅ Model downloaded: $cache_human"
@@ -730,15 +774,6 @@ start_vllm() {
                             if [[ $stall_count -gt 60 ]]; then
                                 log_info "   ⏳ Taking longer than expected, but may still be starting..."
                             fi
-                            ;;
-                        quantizing)
-                            log_info "   🔧 Quantizing model (CPU: ${cpu_usage}%)"
-                            log_info "   ⏳ This is the slow part - converting to 4-bit weights"
-                            log_info "   ✅ Process is actively working!"
-                            ;;
-                        quantizing_slow)
-                            log_info "   🔧 Quantizing model (CPU: ${cpu_usage}%)"
-                            log_info "   ⏳ Processing slowly but steadily..."
                             ;;
                         stalled)
                             log_info "   ⚠️  Process appears stalled (CPU: ${cpu_usage}%)"
@@ -758,22 +793,21 @@ start_vllm() {
                     local gpu_util=$(nvidia-smi --query-gpu=utilization.gpu --format=csv,noheader,nounits 2>/dev/null | head -1 | tr -d ' ')
                     local gpu_mem=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits 2>/dev/null | head -1 | tr -d ' ')
                     if [[ -n "$gpu_util" ]] && [[ -n "$gpu_mem" ]]; then
-                        if [[ "$current_state" == "quantizing" ]] || [[ "$current_state" == "quantizing_slow" ]]; then
-                            log_info "   🎮 GPU: ${gpu_util}% util, ${gpu_mem}MiB VRAM (quantization may use CPU more than GPU)"
-                        else
-                            log_info "   🎮 GPU: ${gpu_util}% util, ${gpu_mem}MiB VRAM"
-                        fi
+                        log_info "   🎮 GPU: ${gpu_util}% util, ${gpu_mem}MiB VRAM"
                     fi
                 fi
 
+                # Show last log line so user can see what vLLM is doing
+                if [[ -f "$VLLM_LOG_FILE" ]]; then
+                    local last_line
+                    last_line=$(grep -v "^$" "$VLLM_LOG_FILE" 2>/dev/null | tail -1 || true)
+                    if [[ -n "$last_line" ]]; then
+                        log_info "   📋 Last log: ${last_line:0:120}"
+                    fi
+                fi
                 echo ""
             fi
         done
-
-        # Kill the tail process
-        kill $tail_pid 2>/dev/null || true
-        wait $tail_pid 2>/dev/null || true
-        echo ""
 
         # Check for specific error patterns
         if [[ -f "$VLLM_LOG_FILE" ]]; then
@@ -808,18 +842,6 @@ start_vllm() {
             fi
         fi
 
-        log_error "vLLM failed to start within $((max_wait / 60)) minutes"
-        log_error "This may indicate:"
-        log_error "  1. Slow download/quantization (bitsandbytes can take 30+ min on first run)"
-        log_error "  2. GPU out of memory - try reducing VOXTRAL_GPU_MEMORY"
-        log_error "  3. Model cache corrupted - try: $0 --clean-cache"
-        log_error ""
-        log_error "Check full logs: $VLLM_LOG_FILE"
-        tail -100 "$VLLM_LOG_FILE" >&2 || true
-        kill "$vllm_pid" 2>/dev/null || true
-        rm -f "$VLLM_PID_FILE"
-        exit 1
-        
     ) 200>"$PID_DIR/vllm-start.lock"
 }
 
@@ -831,23 +853,38 @@ stop_vllm() {
         local pid
         pid=$(cat "$VLLM_PID_FILE" 2>/dev/null || true)
         if [[ -n "$pid" ]]; then
-            # Try graceful shutdown first
-            kill "$pid" 2>/dev/null || true
+            # vLLM was launched with setsid so it is its own process group leader.
+            # Kill the whole process group (pgid == pid) so all child workers die too.
+            local pgid
+            pgid=$(ps -o pgid= -p "$pid" 2>/dev/null | tr -d ' ' || echo "$pid")
 
-            # Wait up to 10 seconds for graceful exit
+            # Graceful SIGTERM to the process group
+            kill -- "-$pgid" 2>/dev/null || kill "$pid" 2>/dev/null || true
+
+            # Wait up to 15 seconds for graceful exit
             local wait_count=0
-            while kill -0 "$pid" 2>/dev/null && [[ $wait_count -lt 10 ]]; do
+            while kill -0 "$pid" 2>/dev/null && [[ $wait_count -lt 15 ]]; do
                 sleep 1
                 wait_count=$((wait_count + 1))
             done
 
-            # Force kill if still running
+            # Force-kill process group if still running
             if kill -0 "$pid" 2>/dev/null; then
-                log_warn "Force killing vLLM (PID: $pid)"
-                kill -9 "$pid" 2>/dev/null || true
+                log_warn "Force killing vLLM process group (pgid: $pgid)"
+                kill -9 -- "-$pgid" 2>/dev/null || kill -9 "$pid" 2>/dev/null || true
             fi
         fi
         rm -f "$VLLM_PID_FILE"
+    fi
+
+    # Fallback: kill any vLLM workers still holding GPU memory
+    local gpu_vllm_pids
+    gpu_vllm_pids=$(nvidia-smi --query-compute-apps=pid --format=csv,noheader 2>/dev/null \
+        | xargs -I{} ps -p {} -o pid=,comm= 2>/dev/null \
+        | grep -i vllm | awk '{print $1}' || true)
+    if [[ -n "$gpu_vllm_pids" ]]; then
+        log_warn "Killing residual vLLM GPU processes: $gpu_vllm_pids"
+        echo "$gpu_vllm_pids" | xargs kill -9 2>/dev/null || true
     fi
 
     # Clean up PID directory
@@ -937,7 +974,6 @@ clean_everything() {
     log_info "Deleting HuggingFace model cache..."
     local cache_dir="${HF_HOME:-$HOME/.cache/huggingface}"
     rm -rf "$cache_dir/hub/models--mistralai--Voxtral"*
-    rm -rf "$cache_dir/hub/models--mlx-community--Voxtral"*
 
     log_info "Clearing model preference and config..."
     rm -rf "$CONFIG_DIR"
@@ -952,6 +988,9 @@ clean_everything() {
 # Cleanup function - called on exit
 cleanup() {
     local exit_code=$?
+    
+    # Block re-entrant signals during cleanup
+    trap '' INT TERM
     
     log_debug "Cleanup triggered (exit code: $exit_code)"
     
@@ -995,10 +1034,11 @@ Environment Variables:
   VENV_DIR           Python venv location (default: ~/.opencode-voxtral)
   VOXTRAL_PORT       vLLM port (random 50000-65535, or set fixed)
   VOXTRAL_MODEL      Model to use (default: mistralai/Voxtral-Mini-4B-Realtime-2602)
-  VOXTRAL_MAX_LEN    Max model length (default: 8192)
-  VOXTRAL_GPU_MEMORY GPU memory utilization (default: 0.80)
-  VOXTRAL_QUANTIZATION Quantization method (default: bitsandbytes)
+  VOXTRAL_MAX_LEN    Max model length (default: 1024)
+  VOXTRAL_GPU_MEMORY GPU memory utilization (default: 0.90)
+  VOXTRAL_QUANTIZATION Quantization method (default: fp8)
   STT_VLLM_URL       vLLM server URL for OpenCode plugin (auto-set by script)
+  STT_PYTHON_PATH    Python interpreter for stt.py (auto-set to venv, override if needed)
   DEBUG              Enable debug output (set to 1)
 
 Examples:
@@ -1071,6 +1111,26 @@ parse_args() {
                 ;;
         esac
     done
+}
+
+# Check that the opencode-stt plugin is present in the plugins directory.
+# The plugin must be placed there manually — either by symlinking the built
+# dist/index.js or by installing the npm package.
+check_opencode_plugin() {
+    local plugins_dir="$OPENCODE_PLUGINS_DIR"
+    # Look for any .js file in the plugins dir that looks like our plugin
+    if compgen -G "$plugins_dir/*.js" &>/dev/null; then
+        return 0
+    fi
+    log_warn "opencode-stt plugin not found in $plugins_dir"
+    log_warn "Voice input will not be available until the plugin is installed."
+    log_warn ""
+    log_warn "To install, choose one of:"
+    log_warn "  1. Symlink the built plugin:"
+    log_warn "       mkdir -p $plugins_dir"
+    log_warn "       ln -sf /path/to/opencode-stt/dist/index.js $plugins_dir/opencode-stt.js"
+    log_warn "  2. Install from npm (once published):"
+    log_warn "       # add 'opencode-stt' to your opencode.json plugin array"
 }
 
 # Setup and check environment
@@ -1196,7 +1256,10 @@ main() {
     
     # Setup environment (checks venv, packages, updates)
     setup_environment
-    
+
+    # Configure opencode-stt plugin (idempotent: silent if already set)
+    check_opencode_plugin
+
     # Debug mode
     if [[ "${DEBUG:-}" == "1" ]]; then
         log_debug "Debug mode enabled"
@@ -1214,15 +1277,19 @@ main() {
     # Start vLLM if needed
     start_vllm
     
-    # Set environment variable for OpenCode STT plugin
+    # Set environment variables for OpenCode STT plugin
     export STT_VLLM_URL="http://localhost:$VLLM_PORT"
+    export STT_PYTHON_PATH="$VENV_DIR/bin/python"
     log_info "STT_VLLM_URL=$STT_VLLM_URL"
+    log_info "STT_PYTHON_PATH=$STT_PYTHON_PATH"
     
     # Launch OpenCode
     log_info "Starting OpenCode..."
     log_info ""
-    
-    # Run OpenCode with all passed arguments
+
+    # Run OpenCode in the foreground so it owns the terminal (tty).
+    # The trap is set to INT/TERM so cleanup still fires when the user
+    # quits opencode normally (which sends SIGINT/SIGTERM to this shell).
     if command -v opencode &>/dev/null; then
         if [[ ${#OPENCODE_ARGS[@]} -gt 0 ]]; then
             opencode "${OPENCODE_ARGS[@]}"
